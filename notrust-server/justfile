@@ -1,0 +1,127 @@
+_default:
+    @just --list --unsorted
+
+HERE           := justfile_directory()
+COMPOSE_FILE   := HERE / "docker-compose.yml"
+DOCKER_COMPOSE := "docker compose --file " + COMPOSE_FILE
+
+set dotenv-load
+set positional-arguments := true
+
+[private]
+echo_color *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    str=""
+    case "$1" in
+        "g") str+="\033[32m" ;;
+        "y") str+="\033[31m" ;;
+        "r") str+="\033[33m" ;;
+    esac
+    str+="$2\033[0m"
+    echo -e $str
+
+# Run COMMAND command in CONTAINER container
+@cmd CONTAINER *COMMAND:
+    -{{DOCKER_COMPOSE}} exec -t {{CONTAINER}} {{COMMAND}}
+
+# Create .env file and generate secret key
+env:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f .env ];
+    then
+        just echo_color y "[*] .env file already exists";
+        exit 0;
+    fi
+    export SECRET_KEY_VALUE=`just secret`
+    envsubst < {{HERE}}/.env.example > .env
+    just echo_color g "[+] .env file created. Don't forget to edit default credentials!"
+
+# Generate secure secret
+secret:
+    python3 -c "import string, secrets; print(str().join(secrets.choice(string.ascii_letters + string.digits + '!@%^&*-_') for i in range(67)))"
+
+
+# Run psql command in postgres container
+psql *ARGS:
+    just cmd postgres 'psql -U {{env('POSTGRES_USER')}} {{env('POSTGRES_DB')}} {{ARGS}}'
+
+migrate:
+    just manage migrate
+
+compile-assets:
+    #!/usr/bin/env bash
+    just cmd assets 'npx gulp build'
+    #cp -r assets/fonts public
+    #cp -r assets/static/* public
+
+lint-dockerfile *ARGS:
+    docker container run --rm -i \
+        hadolint/hadolint hadolint --ignore DL3008 -t style {{ARGS}} - < Dockerfile
+
+# Execute CI pipeline
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    shellcheck bin/*
+    just lint-dockerfile
+
+    just env
+    . .env
+
+    WEB_CONTAINER=`docker ps --all \
+        --filter name="$COMPOSE_PROJECT_NAME-web*" \
+        --format '{{{{.Names}}'`
+
+    [[ ! -z $WEB_CONTAINER && "`docker inspect -f {{{{.State.Running}} $WEB_CONTAINER`" = "true" ]] || \
+        just start --detach
+
+    POSTGRES_CONTAINER=`docker ps --all \
+        --filter name="$COMPOSE_PROJECT_NAME-postgres*" \
+        --format '{{{{.Names}}'`
+
+    until [[ ! -z $POSTGRES_CONTAINER && "`docker inspect -f {{{{.State.Running}} $POSTGRES_CONTAINER`" = "true" ]]; do
+        sleep 0.1;
+    done
+
+    just lint-python
+    just format-imports #--check
+    just format-python #--check --diff
+    just manage migrate
+    just manage test
+    just compile-assets
+
+logs *ARGS:
+    {{DOCKER_COMPOSE}} logs {{ARGS}}
+
+
+# Build docker image and start containers
+start *ARGS:
+    {{DOCKER_COMPOSE}} up --build --force-recreate {{ARGS}}
+
+# Delete docker containers/volumes
+delete:
+    -{{DOCKER_COMPOSE}} down --volumes
+
+# Remove cache and other generated files
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    rm -rf public/* \
+        public_collected/* \
+        .pytest_cache/ .coverage celerybeat-schedule
+
+    touch public/.keep public_collected/.keep
+
+# Delete containers, volumes and images
+purge: delete && clean
+    -docker rm --force `docker ps --all \
+        --filter name='{{env('COMPOSE_PROJECT_NAME')}}*' \
+        --format '{{{{.ID}}'`
+
+    -docker rmi `docker images \
+        --filter reference='{{env('COMPOSE_PROJECT_NAME')}}*' \
+        --format '{{{{.Repository}}:{{{{.Tag}}'`
